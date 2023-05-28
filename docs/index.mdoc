@@ -1,0 +1,1100 @@
+## What is Markprompt?
+
+Markprompt is three things:
+
+- A set of API endpoints that allow you to train your content and create a prompt to ask questions to it, for instance for a docs site.
+- A [web dashboard](https://markprompt.com) that makes it easy to do the above. The dashboard also allows you to set up syncing with a GitHub repo or a website, drag and drop files to train, manage access keys, and visualize stats on how users query your content.
+- A set of UI components (currently [React](#react) and [Web Component](#web-component)) that make it easy to integrate a prompt on your existing site.
+
+Markprompt is [open source](https://github.com/motifland/markprompt), so you are free to host the dashboard and model backend on your own premises. We also warmly welcome [contributions](https://github.com/motifland/markprompt/pulls).
+
+### Supported formats
+
+Currently, Markprompt supports files in the following format:
+
+- Markdown
+- Markdoc
+- MDX
+- HTML
+- Plain text
+
+We plan to support other formats in the future, such as [AsciiDoc](https://github.com/motifland/markprompt/issues/5) and reStructuredText.
+
+## Quick start
+
+The quickest way to get started is to navigate to the [Markprompt dashboard](https://markprompt.com) and follow the onboarding, which consists of two steps:
+
+- Step 1: Uploading and processing a set of files
+- Step 2: Querying the content in a playground
+
+Once you have completed the onboarding, you can expose a prompt, for instance on a website, using our [API endpoints](#api) or our [React](#react) or [Web Component](#web-component).
+
+{% note %}
+A good starting point for integrating a prompt on your website is the [Markprompt Starter Template](https://github.com/motifland/markprompt-starter-template), which is a sample Next.js application containing the full code for the prompt component, ready to query your content.
+{% /note %}
+
+### Processing your content
+
+When you upload your files, Markprompt will split them into sections. A section is delimited by headings (`#`, `##`, ... in Markdown, `<h1>`, `<h2>`, ... in HTML). For instance, if your content looks as follows:
+
+```md
+## Welcome to the Acme docs
+
+Thank you for choosing the Acme Framework...
+
+### What is the Acme Framework?
+
+The Acme Framework is a collection of...
+
+### Getting Started
+
+To get started using the Acme Framework...
+```
+
+three sections will be generated, one for each opening heading.
+
+Then, each section is passed to the [OpenAI Embeddings API](https://platform.openai.com/docs/guides/embeddings). This creates a "signature" for the content, in the form of a vector that captures essential traits of your content, and makes it possible to subsequently measure how "close" two pieces of content are. It is using the `text-embedding-ada-002` model.
+
+### Querying your content
+
+Now that your content is indexed, we can query it. It happens in two steps.
+
+#### Finding matching sections
+
+When a user enters a query, say "How do I self-host the database", Markprompt transforms that query into an embedding, exactly like it did with the sections in the previous step. This embedding can then be compared to each of your indexed sections, the goal being to find the sections that are "close" to the question, that is, are likely to contain useful information to answer the question. The embeddings are stored in [Supabase](https://supabase.com/) as a `pgvector`, which provides operations to efficiently compare vectors. This is nicely explained on the Supabase blog: [Storing OpenAI embeddings in Postgres with pgvector](https://supabase.com/blog/openai-embeddings-postgres-vector).
+
+#### Building a prompt with context
+
+Markprompt picks the top-10 closest embeddings, if they exist. Among these 10, it also filters out the ones with too little similarity (to avoid unnecessary noise), and the last ones if too large combined.
+
+The source that created these embeddings is then injected into the following "parent prompt" (which you can edit in the dashboard):
+
+```
+You are a very enthusiastic company representative
+who loves to help people! Given the following sections
+from the documentation, answer the question using only that
+information, outputted in Markdown format. If you are unsure
+and the answer is not explicitly written in the documentation,
+say "I don't know".
+
+Context sections:
+---
+{sections}
+
+Question: "{input prompt}"
+
+Answer (including related code snippets if available):
+```
+
+and sent to the [OpenAI Completions API](https://platform.openai.com/docs/guides/completion). By default, the API streams back a response as a [ReadableStream](https://developer.mozilla.org/en-US/docs/Web/API/ReadableStream). The stream is of the form:
+
+```
+[path1,path2,...]___START_RESPONSE_STREAM___In order to self-host...
+```
+
+More precisely, the response stream is split in two parts, separated by the `___START_RESPONSE_STREAM___` tag:
+
+- The first part of the stream is the list of references that were used to produce the content. Namely the page IDs containing the sections that were used in the final prompt.
+- The second part is the streamed response, which is the actual result that the completions endpoint produced as an answer to the input prompt.
+
+Note that if the `stream` flag is set to false, the response is returned as a plain JSON object, as detailed in the [completions API reference](#create-completion).
+
+## API
+
+Markprompt exposes two endpoints at `https://api.markprompt.com`:
+
+- `/v1/train`: turn your content into embeddings
+- `/v1/completions`: get completions for user prompts
+
+The `/v1/train` endpoint requires authorization using a bearer token. This token can be found in your project settings in the dashboard, and should never be shared publicly. If you suspect that your token has been compromised, you can generate a new one in the dashboard. The `/v1/completions` endpoint can be accessed either from the server using the bearer token, or from the client side using a development key (for non-public testing) or a production key from a whitelisted domain (for public sharing). See below for more details.
+
+### Train content
+
+{% note %}
+Using this endpoint is relevant if you want to programmatically index your content, for instance in a [GitHub action](https://docs.github.com/en/actions). If you don't need this level of automation, we recommend that you use the Markprompt dashboard, which offers simple tools such as GitHub sync and drag-and-drop to make the process easy and setup-free.
+{% /note %}
+
+```http
+POST https://api.markprompt.com/v1/train
+```
+
+Creates and indexes embeddings for your content.
+
+The endpoint accepts two types of payloads:
+
+- A JSON payload.
+- A file payload, for uploading a zip file or a plain text file.
+
+#### Request body (JSON)
+
+In the case of a JSON payload, the content type header must be `application/json`. The JSON payload must be of the form:
+
+{% table %}
+* Key
+* Type
+* Description
+---
+* `files`
+* array (optional)
+* A set of objects with the keys:
+  - `id` a unique identifier for your file, for instance its path in a file system.
+  - `content` the textual content of the file.
+{% /table %}
+
+Example request:
+
+```bash
+curl https://api.markprompt.com/v1/train \
+  -X POST \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    files: [
+      { id: "file_id_1", content: "..." },
+      { id: "file_id_2", content: "..." },
+    ]
+  }'
+```
+
+#### Request body (file)
+
+In the case of a file payload, the content type header must be `application/zip` or `application/octet-stream`.
+
+Example request:
+
+```bash
+curl https://api.markprompt.com/v1/train \
+  -X POST \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/zip" \
+  --data-binary @data.zip
+```
+
+Here is an example in JavaScript that reads a file from disk and sends it to the `/train` endpoint:
+
+```js
+const fs = require('fs')
+
+const file = fs.createReadStream('data.zip');
+
+await fetch('https://api.markprompt.com/v1/train', {
+  method: 'POST',
+  body: file,
+  headers: {
+    'Authorization': 'Bearer <TOKEN>',
+    'Content-Type': 'application/zip',
+  },
+});
+```
+
+#### Request headers
+
+- `Authorization`
+
+  The authorization header, carrying the bearer token.
+- `Content-Type`
+
+  The content type of the payload. Currently supported values are `application/json`, `application/zip` and `application/octet-stream`.
+- `x-markprompt-force-retrain`
+
+  By default, if a file has been trained, sending it again with the same content will not retrain the file. If for some reason you want to force a retraining, you can pass a long this header with the value set to `true`.
+
+### Create completion
+
+```http
+POST https://api.markprompt.com/v1/completions
+```
+
+Creates a completion for the provided prompt, taking into account the content you have trained your project on.
+
+#### Request body
+
+{% table %}
+* Key
+* Type
+* Description
+---
+* `prompt`
+* string
+* The input prompt to generate completions for.
+---
+* `projectKey`
+* string
+* The API key associated to your project. If shared publicly, use the production key from a whitelisted domain. If not, for instance on localhost, use the development key.
+---
+* `model`
+* `gpt-4` | `gpt-4-0314` | `gpt-4-32k` | `gpt-4-32k-0314` | `gpt-3.5-turbo` | `gpt-3.5-turbo-0301` | `text-davinci-003` | `text-davinci-002` | `text-curie-001` | `text-babbage-001` | `text-ada-001` | `davinci` | `curie` | `babbage` | `ada`
+* The [completions model](https://platform.openai.com/docs/api-reference/completions) to use.
+---
+* `iDontKnowMessage`
+* string
+* Message to return when no response is found.
+---
+* `promptTemplate`
+* string
+* Custom [prompt template](#template) that wraps prompt and context.
+---
+* `stream`
+* boolean
+* If true, return the response as a [Readable Stream](https://developer.mozilla.org/en-US/docs/Web/API/ReadableStream). Otherwise, return as a plain JSON object. Default: true.
+---
+* `temperature`
+* number
+* The model temperature. Default: 0.1.
+---
+* `topP`
+* number
+* The model top P. Default: 1.
+---
+* `frequencyPenalty`
+* number
+* The model frequency penalty. Default: 0.
+---
+* `presencePenalty`
+* number
+* The model presence penalty. Default: 0.
+---
+* `maxTokens`
+* number
+* The max number of tokens to include in the response. Default: 500.
+---
+* `sectionsMatchCount`
+* number
+* The number of sections to include in the prompt context. Default: 10.
+---
+* `sectionsMatchThreshold`
+* number
+* The similarity threshold between the input question and selected sections. The higher the threshold, the more relevant the sections. If it's too high, it can potentially miss some sections. Default: 0.5.
+{% /table %}
+
+#### Example request
+
+```bash
+curl https://api.markprompt.com/v1/completions \
+  -X POST \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "How do I self-host the database?",
+    "iDontKnowMessage": "Sorry, I do not know.",
+    "model": "gpt-4"
+  }'
+```
+
+#### Response
+
+By default, the response is returned as a [ReadableStream](https://developer.mozilla.org/en-US/docs/Web/API/ReadableStream) of the form:
+
+```
+[path1,path2,...]___START_RESPONSE_STREAM___In order to self-host...
+```
+
+The stream is split in two parts, separated by the `___START_RESPONSE_STREAM___` tag:
+
+- The first part of the stream is the list of references that were used to produce the content. Namely the page IDs containing the sections that were used in the final prompt.
+- The second part is the streamed response, which is the actual result that the completions endpoint produced as an answer to the input prompt.
+
+If the `stream` flag is set to false, the response is returned as a plain JSON object with a `text` field containing the completion, and a `references` field containing the list of references used to create the completion:
+
+```json
+{
+  text: "Completion response...",
+  references: ["page1", ...]
+}
+```
+
+{% note type="warning" %}
+When querying completions, do not use the bearer token if the code is exposed publicly, for instance on a public website. Instead, use the project production key, and make the request from a whitelisted domain. Obtaining the project production key and whitelisting the domain is done in the project settings.
+{% /note %}
+
+Here is a working example of how to consume the stream in JavaScript. Note the use of `projectKey` and no authorization header: this code can be shared publicly, and will work from a domain you have whitelisted in the project settings.
+
+```js
+const res = await fetch('https://api.markprompt.com/v1/completions', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    prompt: 'How do I self-host a database?',
+    iDontKnowMessage: 'I don't know',
+    projectKey: '<your_project_key>',
+    model: 'gpt-3.5-turbo'
+  }),
+});
+
+if (!res.ok || !res.body) {
+  console.error('Error:', await res.text());
+  return;
+}
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let response = '';
+
+while (true) {
+  const { value, done } = await reader.read();
+  const chunk = decoder.decode(value);
+  response = response + chunk;
+  if (done) {
+    break;
+  }
+}
+
+const parts = response.split('___START_RESPONSE_STREAM___');
+
+console.info('Answer:', parts[1]);
+console.info('References:', parts[0]);
+```
+
+### Get sections
+
+```http
+GET https://api.markprompt.com/v1/sections
+```
+
+Retrieves a list of sections that match a prompt.
+
+{% note %}
+The `/v1/sections` endpoint is available as part of the Enterprise plan.
+{% /note %}
+
+#### Request body
+
+{% table %}
+* Key
+* Type
+* Description
+---
+* `prompt`
+* string
+* The input prompt.
+---
+* `sectionsMatchCount`
+* number
+* The number of sections to retrieve. Default: 10.
+---
+* `sectionsMatchThreshold`
+* number
+* The similarity threshold between the input prompt and selected sections. The higher the threshold, the more relevant the sections. If it's too high, it can potentially miss some sections. Default: 0.5.
+{% /table %}
+
+#### Example request
+
+```bash
+curl https://api.markprompt.com/v1/sections \
+  -X GET \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-type: application/json" \
+  -H "Accept: application/json" \
+  -d '{"prompt":"what is a component?", "sectionsMatchCount": 20, "sectionsMatchThreshold": 0.4 }'
+```
+
+#### Response
+
+The response is of the form:
+
+```json
+{
+  data: [
+    {
+      path: "/path/to/section/1",
+      content: "Section 1 content...",
+      similarity: /* Similarity score */
+    },
+    {
+      path: "/path/to/section/2",
+      content: "Section 2 content...",
+      similarity: /* Similarity score */
+    },
+    ...
+  ]
+}
+```
+
+## Configuration
+
+You can specify glob patterns for paths to include and exclude from training in the project configuration file. It can be found in the project settings, and is a JSON file of the form:
+
+```json
+{
+  "include": [
+    "**/*.md",
+    "**/*.mdoc",
+    "**/*.mdx",
+    "**/*.html",
+    "**/*.txt"
+  ],
+  "exclude": []
+}
+```
+
+Each entry in the `include` and `exclude` list is a [glob pattern](https://en.wikipedia.org/wiki/Glob_(programming)). Here a some examples:
+
+- `"**/*.md"`: all paths ending with `.md`, in any folder.
+- `/README.md`: the `README.md` file in the root folder.
+- `/docs/*`: all files in the `/docs` folder, but not in subfolders of the `/docs` folder.
+
+The configuration should be read as follows: if the file's path does not match a pattern under the `include` entry, it will be excluded. If it does, it will be included, unless it matches a pattern in the `exclude` entry.
+
+## Templates
+
+When querying the completions endpoint, the user's prompt is wrapped inside a parent prompt that injects context that is used for building the answer. The default prompt is the following:
+
+```
+{% $defaultPromptTemplate %}
+```
+
+Here, `{{PROMPT}}` is the prompt that you pass along the request to the completions endpoint; `{{I_DONT_KNOW}}` is an optional query parameter in case no answer is found; and `{{CONTEXT}}` corresponds to the sections that Markprompt automatically injects based on vector similarities between the prompt and the indexed content sections.
+
+When querying the completions endpoint, you can pass along your own custom prompt template. This can be useful for things like:
+
+- Adding branding and tone
+- Replying in other languages than English
+- Adding business logic
+
+Here is a sample request with a custom template:
+
+```js
+const res = await fetch('https://api.markprompt.com/v1/completions', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    prompt: 'How do I self-host a database?',
+    iDontKnowMessage: 'I don't know',
+    projectKey: '<your_project_key>',
+    model: 'gpt-4',
+    promptTemplate: 'You are a support engineer working at Acme! You write in a very friendly, cheerful tone. [...]'
+  }),
+});
+```
+
+Here are some simple examples of custom prompt templates:
+
+### Branding and tone
+
+Here is a simple example adding branding and tone instructions:
+
+```
+You are a support engineer working at Acme! You write in a very friendly, cheerful tone.
+...
+```
+
+### Internationalization
+
+Another example is producing consistent answers in specific languages. For instance, if your content is in Japanese, you will probably want to use a Japanese prompt:
+
+```
+あなたは人々を助けることが大好きな非常に熱心な会社の代表者です！以下のドキュメントのセクション（セクションIDで始まる）を使用して、その情報だけを使用して質問に答え、Markdown形式で出力してください。
+...
+```
+
+### Business logic
+
+Here is an example showing how to handle some seemingly complex requirements by properly engineering a prompt. The scenario is the following: some pages of your docs contain anchor links, like `[Step 1](#step-1)`, to nagivate to other parts of the same page. Let's say the completions endpoint produces an answer based off of three different pages. We want that when clicking the anchor link, it opens up the page that contains this link specifically. Fortunately, in addition to the section content, Markprompt injects the associated section id (typically, the path of the file where the content is from, like `/docs/introduction/getting-started.md`), and this id can be used to construct an absolute link, for instance `[Step 1](/introduction/getting-started#step-1)`. The following prompt will take care of prepending the appropriate base path to anchor links:
+
+```
+You are a very enthusiastic company representative from Acme who loves to help people! Below is a list of context sections separated by three dashes ('---'). They consist of a section id, which corresponds to the file from which the section is in, followed by the actual section content, in Markdown format.
+
+In the content, you may find relative links in Markdown format. Some examples are [Step 1](#step1), [Creating a project](getting-started/new-project.md), [Home](/docs/index.md). If you encounter such a link, you need to reconstruct the full path. Here is how you should do it:
+- First, transform the section id to an absolute URL path, and remove the "/docs" prefix. For instance, "/docs/getting-started/create-project.md" should be turned into "/getting-started/create-project". Note that filenames like "index.md" corresponding to a root path, so for instance, "/docs/tutorials/index.md" becomes "/docs/tutorials".
+- Given this absolute base path, prepend it to the relative link. For instance, if the link "[Step 1](#step1)" comes from a section whose id is "/docs/getting-started/create-project.md", then this link should be turned into "[Step 1](/getting-started/create-project#step1)". Similarly, if the link [Creating a project](getting-started/new-project.md) comes from a section whose id is "/docs/tutorial/index.md", then this link should be turned into "[Creating a project](/tutorial/getting-started/new-project)".
+
+Finally, you should always offer answers with high conviction, based on the provided context. If you are unsure and the answer is not explicitly written in the context, say "Sorry, I do not know.".
+
+Context sections:
+---
+{{CONTEXT}}
+
+Question: "{{PROMPT}}"
+
+Answer (including related code snippets if available):`
+```
+
+## Components
+
+### React
+
+The Markprompt React component is a headless component that offers you a simple, accessible and fully customizable way to add a prompt UI to your React applications. It is based off of [Radix UI's](https://www.radix-ui.com/) [Dialog component](https://www.radix-ui.com/docs/primitives/components/dialog), and presents a similar API.
+
+{% playground /%}
+
+#### Installation and usage
+
+{% note %}
+For a working example, check out the [Markprompt starter template](https://github.com/motifland/markprompt-starter-template).
+{% /note %}
+
+Install the `@markprompt/react` package via NPM or Yarn:
+
+```bash
+# NPM
+npm install @markprompt/react react @radix-ui/react-visually-hidden
+# Yarn
+yarn add @markprompt/react react @radix-ui/react-visually-hidden
+```
+
+In your React application, paste the following in an MDX, JSX or TSX file:
+
+```jsx
+import { Markprompt } from '@markprompt/react';
+import { ChatIcon, CloseIcon, SearchIcon, Caret } from "./icons"
+import { VisuallyHidden } from '@radix-ui/react-visually-hidden';
+import { useContext } from 'react';
+
+function Component() {
+  return (
+    <Markprompt.Root
+      projectKey="<projectKey>"
+      loadingHeading="Fetching relevant pages…"
+      model="gpt-4"
+    >
+      <Markprompt.Trigger
+        aria-label="Open Markprompt"
+        className="MarkpromptButton"
+      >
+        <ChatIcon className="MarkpromptIcon" />
+      </Markprompt.Trigger>
+      <Markprompt.Portal>
+        <Markprompt.Overlay className="MarkpromptOverlay" />
+        <Markprompt.Content className="MarkpromptContent">
+          <Markprompt.Close className="MarkpromptClose">
+            <CloseIcon />
+          </Markprompt.Close>
+
+          {/* Markprompt.Title is required for accessibility reasons. It can be hidden using an accessible content hiding technique. */}
+          <VisuallyHidden asChild>
+            <Markprompt.Title>
+              Ask me anything about Markprompt
+            </Markprompt.Title>
+          </VisuallyHidden>
+
+          {/* Markprompt.Description is included for accessibility reasons. It is optional and can be hidden using an accessible content hiding technique. */}
+          <VisuallyHidden asChild>
+            <Markprompt.Description>
+              I can answer your questions about Markprompt's client-side
+              libraries, onboarding, API's and more.
+            </Markprompt.Description>
+          </VisuallyHidden>
+
+          <Markprompt.Form>
+            <SearchIcon className="MarkpromptSearchIcon" />
+            <Markprompt.Prompt className="MarkpromptPrompt" />
+          </Markprompt.Form>
+
+          <Markprompt.AutoScroller className="MarkpromptAnswer">
+            <Caret />
+            <Markprompt.Answer />
+          </Markprompt.AutoScroller>
+
+          <References />
+        </Markprompt.Content>
+      </Markprompt.Portal>
+    </Markprompt.Root>
+  );
+}
+
+const capitalize = (text: string) => {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+const removeFileExtension = (fileName: string) => {
+  const lastDotIndex = fileName.lastIndexOf('.');
+  if (lastDotIndex === -1) {
+    return fileName;
+  }
+  return fileName.substring(0, lastDotIndex);
+};
+
+const Reference = ({
+  referenceId,
+  index,
+}: {
+  referenceId: string;
+  index: number;
+}) => {
+  return (
+    <li
+      key={referenceId}
+      className="reference"
+      style={{
+        animationDelay: `${100 * index}ms`,
+      }}
+    >
+      <a href={removeFileExtension(referenceId)}>
+        {capitalize(removeFileExtension(referenceId.split('/').slice(-1)[0]))}
+      </a>
+    </li>
+  );
+};
+
+const References = () => {
+  const { state, references } = useContext(Markprompt.Context);
+
+  if (state === 'indeterminate') return null;
+
+  let adjustedState: string = state;
+  if (state === 'done' && references.length === 0) {
+    adjustedState = 'indeterminate';
+  }
+
+  return (
+    <div data-loading-state={adjustedState} className={styles.references}>
+      <div className={styles.progress} />
+      <p>Fetching relevant pages…</p>
+      <p>Answer generated from the following sources:</p>
+      <Markprompt.References RootElement="ul" ReferenceElement={Reference} />
+    </div>
+  );
+};
+```
+
+replacing `<projectKey>` with the key associated to your project. It can be obtained in the project settings under "Project key".
+
+#### Component API
+
+**Markprompt.Root**
+
+{% table %}
+* Prop
+* Default value
+* Description
+---
+* `projectKey`
+*
+* Your project&apos;s API key, found in the project settings. Use the test key for local development to bypass domain whitelisting.
+---
+* `model`
+* `gpt-3.5-turbo`
+* `gpt-4` | `gpt-4-0314` | `gpt-4-32k` | `gpt-4-32k-0314` | `gpt-3.5-turbo` | `gpt-3.5-turbo-0301` | `text-davinci-003` | `text-davinci-002` | `text-curie-001` | `text-babbage-001` | `text-ada-001` | `davinci` | `curie` | `babbage` | `ada`
+---
+* `iDontKnowMessage`
+* Sorry, I am not sure how to answer that.
+* Fallback message in can no answer is found.
+---
+* `placeholder`
+* Ask me anything...
+* Message to show in the input box when no text has been entered.
+---
+* `promptTemplate`
+*
+* Custom [prompt template](#templates) that wraps prompt and context.
+---
+* `temperature`
+* number
+* The model temperature. Default: 0.1.
+---
+* `topP`
+* number
+* The model top P. Default: 1.
+---
+* `frequencyPenalty`
+* number
+* The model frequency penalty. Default: 0.
+---
+* `presencePenalty`
+* number
+* The model presence penalty. Default: 0.
+---
+* `maxTokens`
+* number
+* The max number of tokens to include in the response. Default: 500.
+---
+* `sectionsMatchCount`
+* number
+* The number of sections to include in the prompt context. Default: 10.
+---
+* `sectionsMatchThreshold`
+* number
+* The similarity threshold between the input question and selected sections. The higher the threshold, the more relevant the sections. If it's too high, it can potentially miss some sections. Default: 0.5.
+{% /table %}
+
+{% note %}
+Note that configuring model parameters, such as `temperature` and `maxTokens`, is a feature of the Pro and Enterprise plans, but can be freely tested in the Markprompt dashboard.
+{% /note %}
+
+#### Development setup
+
+When testing in a local development environment, for instance on localhost, use the **development project key**. This is a private key that can be used from any host, bypassing domain whitelisting. For that reason, make sure to keep it private.
+
+#### Production setup
+
+When going live, the use the **production project key**. This is a public key that can safely be shared, and can only access the API from whitelisted domains. Whitelisting a domain is likewise done in the project settings.
+
+#### Styling
+
+Check out our [markprompt-js](https://github.com/motifland/markprompt-js) repo on GitHub for working examples using CSS modules and Tailwind CSS.
+
+### Web Component
+
+The Markprompt Web Component offers a simple way to add a chat prompt to your website directly in your HTML.
+
+#### Installation and usage
+
+Add the following script tag to your HTML page:
+
+```html
+<script type="module" src="https://esm.sh/@markprompt/web@0.3.5" />
+```
+
+Then add the `markprompt-content` component anywhere on your page:
+
+```html
+<markprompt-content projectKey="<project-key>" />
+```
+
+replacing `<projectKey>` with the key associated to your project. It can be obtained in the project settings under "Project key".
+
+#### Component API
+
+{% table %}
+* Prop
+* Default value
+* Description
+---
+* `projectKey`
+*
+* Your project&apos;s API key, found in the project settings. Use the test key for local development to bypass domain whitelisting.
+---
+* `model`
+* `gpt-3.5-turbo`
+* `gpt-4` | `gpt-4-0314` | `gpt-4-32k` | `gpt-4-32k-0314` | `gpt-3.5-turbo` | `gpt-3.5-turbo-0301` | `text-davinci-003` | `text-davinci-002` | `text-curie-001` | `text-babbage-001` | `text-ada-001` | `davinci` | `curie` | `babbage` | `ada`
+---
+* `iDontKnowMessage`
+* Sorry, I am not sure how to answer that.
+* Fallback message in can no answer is found.
+---
+* `placeholder`
+* Ask me anything...
+* Message to show in the input box when no text has been entered.
+---
+* `promptTemplate`
+*
+* Custom [prompt template](#templates) that wraps prompt and context.
+---
+* `idToRefMap`
+* `{}`
+* A map of the form `{ string: { href, label }}` providing a mapping between reference ids and href/label, used to turn the reference into links.
+{% /table %}
+
+Example:
+
+```html
+<markprompt-content
+  projectKey="..."
+  model="..."
+  iDontKnowMessage="Sorry, I don't know!"
+  placeholder="Ask Acme docs..."
+/>
+```
+
+The component also supports the following methods:
+
+- `getRefFromId(id: string) => { [key: string]: { href: string, label: string} }`
+
+  This map can be used as a functional alternative to `idToRefMap`, e.g. for dynamically computing links and labels:
+
+  ```js
+  const component = document.getElementsByTagName('markprompt-content')[0];
+
+  component.getRefFromId = (id) => {
+    let path = id.replace(/\.md$/, '')
+
+    return { label: path, href: path }
+  };
+  ```
+
+- `reset()`
+
+  Clears the input and the result, e.g. when closing a dialog containing the component.
+
+- `focus()`
+
+  Brings focus on the input component, e.g. when opening a dialog containing the component.
+
+#### Development setup
+
+When testing in a local development environment, for instance on localhost, use the **development project key**. This is a private key that can be used from any host, bypassing domain whitelisting. For that reason, make sure to keep it private.
+
+#### Production setup
+
+When going live, the use the **production project key**. This is a public key that can safely be shared, and can only access the API from whitelisted domains. Whitelisting a domain is likewise done in the project settings.
+
+#### Styling
+
+The Markprompt web component is styled via the following CSS variables (shown with some sample values):
+
+```css
+--accent-color
+--answer-code-background-color
+--answer-code-border-radius
+--answer-code-padding-x
+--answer-code-padding-y
+--answer-heading1-font-size
+--answer-heading1-margin-bottom
+--answer-heading1-margin-top
+--answer-heading2-font-size
+--answer-heading2-margin-bottom
+--answer-heading2-margin-top
+--answer-heading3-font-size
+--answer-heading3-margin-bottom
+--answer-heading3-margin-top
+--answer-heading4-margin-bottom
+--answer-heading4-margin-top
+--answer-image-border-radius
+--answer-image-margin-y
+--answer-list-bullet-color
+--answer-list-numbered-color
+--answer-list-padding-left
+--answer-list-padding-y
+--answer-max-width
+--answer-padding
+--answer-paragraph-margin
+--answer-pre-background-color
+--answer-pre-border-radius
+--answer-pre-line-height
+--answer-pre-margin-y
+--answer-pre-padding
+--answer-pre-text-color
+--answer-quote-border-color
+--answer-quote-border-left
+--answer-quote-font-style
+--answer-quote-margin-y
+--answer-quote-padding-left
+--answer-table-head-padding
+--answer-table-margin-y
+--border-color
+--caret-color
+--font-size-base
+--font-size-sm
+--font-size-xs
+--input-container-background-color
+--input-container-border-bottom-style
+--input-container-border-bottom-width
+--input-container-gap
+--input-container-height
+--input-container-icon-size
+--input-container-padding
+--input-placeholder-color
+--line-height-base
+--link-color
+--link-text-decoration
+--link-weight
+--prompt-input-border-radius
+--prompt-input-padding
+--references-container-color
+--references-container-line-height
+--references-container-max-height
+--references-container-padding
+--references-gap
+--references-heading-font-size
+--references-heading-font-weight
+--references-heading-padding-bottom
+--reference-item-background-color-hover
+--reference-item-background-color
+--reference-item-border-radius
+--reference-item-font-size
+--reference-item-font-weight
+--reference-item-padding-x
+--reference-item-padding-y
+--result-background-color
+--search-icon-color
+--slide-up-translate-x
+--spacer-height
+--text-color
+```
+
+For example, here is a CSS configuration that sets the background color in light and dark mode:
+
+```css
+markprompt-content {
+  --background-color: #ffffff;
+}
+
+markprompt-content.dark {
+  --background-color: #000000;
+}
+```
+
+Dark mode can be achieved by add the `dark` class to the component. It can also be toggled dynamically using [MutationObserver](https://developer.mozilla.org/en-US/docs/Web/API/MutationObserver):
+
+```html
+<markprompt-content class="dark" />
+```
+
+#### Full example
+
+Here is a full example HTML file.
+
+```html
+<!DOCTYPE html>
+<html lang="en-US">
+  <head>
+    <script src="https://esm.sh/@markprompt/web@0.3.5" type="module"></script>
+    <style>
+      html {
+        font-family: sans-serif;
+      }
+
+      markprompt-content {
+        display: block;
+        width: 600px;
+        height: 400px;
+        border: 1px solid #e5e5e5;
+        border-radius: 8px;
+        overflow: hidden;
+
+        --accent-color: #6366f1;
+        --answer-code-background-color: #f1f5f9;
+        --answer-code-border-radius: 0.25em;
+        --answer-code-padding-x: 4px;
+        --answer-code-padding-y: 2px;
+        --answer-heading1-font-size: 2.25em;
+        --answer-heading1-margin-bottom: 0.8888889em;
+        --answer-heading1-margin-top: 0;
+        --answer-heading2-font-size: 1.5em;
+        --answer-heading2-margin-bottom: 1em;
+        --answer-heading2-margin-top: 2em;
+        --answer-heading3-font-size: 1.25em;
+        --answer-heading3-margin-bottom: 0.6em;
+        --answer-heading3-margin-top: 1.6em;
+        --answer-heading4-margin-bottom: 0.5em;
+        --answer-heading4-margin-top: 1.5em;
+        --answer-image-border-radius: 0.375em;
+        --answer-image-margin-y: 1em;
+        --answer-list-bullet-color: #d4d4d4;
+        --answer-list-numbered-color: #171717;
+        --answer-list-padding-left: 1.625em;
+        --answer-list-padding-y: 0.5em;
+        --answer-max-width: 65ch;
+        --answer-padding: 16px;
+        --answer-paragraph-margin: 20px;
+        --answer-pre-background-color: #0f172a;
+        --answer-pre-border-radius: 0.375em;
+        --answer-pre-line-height: 1.5;
+        --answer-pre-margin-y: 1em;
+        --answer-pre-padding: 1em;
+        --answer-pre-text-color: #f8fafc;
+        --answer-quote-border-color: #171717;
+        --answer-quote-border-left: 0.2em;
+        --answer-quote-font-style: italic;
+        --answer-quote-margin-y: 1.5em;
+        --answer-quote-padding-left: 1em;
+        --answer-table-head-padding: 0.5em;
+        --answer-table-margin-y: 1em;
+        --border-color: #e5e5e5;
+        --caret-color: #6366f1;
+        --font-size-base: 16px;
+        --font-size-sm: 14px;
+        --font-size-xs: 12px;
+        --input-container-background-color: #ffffff;
+        --input-container-border-bottom-style: solid;
+        --input-container-border-bottom-width: 1px;
+        --input-container-gap: 8px;
+        --input-container-height: 40px;
+        --input-container-icon-size: 16px;
+        --input-container-padding: 16px;
+        --input-placeholder-color: #a3a3a3;
+        --line-height-base: 1.5;
+        --link-color: #6366f1;
+        --link-text-decoration: underline;
+        --link-weight: 600;
+        --prompt-input-border-radius: 0px;
+        --prompt-input-padding: 8px;
+        --references-container-color: #f8fafc;
+        --references-container-line-height: 20px;
+        --references-container-max-height: 200px;
+        --references-container-padding: 16px;
+        --references-gap: 8px;
+        --references-heading-font-size: 12px;
+        --references-heading-font-weight: 600;
+        --references-heading-padding-bottom: 12px;
+        --reference-item-background-color-hover: #fff;
+        --reference-item-background-color: #fff;
+        --reference-item-border-radius: 4px;
+        --reference-item-font-size: 12px;
+        --reference-item-font-weight: 600;
+        --reference-item-padding-x: 8px;
+        --reference-item-padding-y: 4px;
+        --result-background-color: #f8fafc;
+        --search-icon-color: #6366f1;
+        --slide-up-translate-x: 20px;
+        --spacer-height: 100px;
+        --text-color: #171717;
+      }
+    </style>
+  </head>
+  <body>
+    <markprompt-content projectKey="<project-key>" />
+    <script>
+      const component = document.getElementsByTagName("markprompt-content")[0];
+
+      component.getRefFromId = (id) => {
+        const href = id.replace(/.md(x|oc)?$/, "");
+        const label = id
+          .split("/")
+          .slice(-1)[0]
+          .split(".")
+          .slice(0, -1)
+          .join(".");
+        return { href, label };
+      };
+
+      component.promptTemplate = `You are a very enthusiastic company representative who loves to help people! Given the following sections from the documentation (preceded by a section id), answer the question using only that information, outputted in Markdown format. If you are unsure and the answer is not explicitly written in the documentation, say "\{\{I_DONT_KNOW\}\}".
+
+Context sections:
+---
+\{\{CONTEXT\}\}
+
+Question: "\{\{PROMPT\}\}"
+
+Answer (including related code snippets if available):\n`;
+    </script>
+  </body>
+</html>
+```
+
+## Usage
+
+Currently, the Markprompt API has basic protection against misuse when making requests from public websites, such as rate limiting, IP blacklisting, allowed origins, and prompt moderation. These are not strong guarantees against misuse though, and it is always safer to expose an API like Markprompt's to authenticated users, and/or in non-public systems using private access tokens. We do plan to offer more extensive tooling on that front (hard limits, spike protection, notifications, query analysis, flagging).
+
+## Data retention
+
+OpenAI keeps training data for 30 days. Read more: [OpenAI API data usage policies](https://openai.com/policies/api-data-usage-policies).
+
+Markprompt keeps the data as long as you need to query it. If you remove a file or delete a project, all associated data will be deleted immediately.
+
+## FAQ
+
+{% collapsegroup %}
+{% collapse title="Does Markprompt come up with imaginary answers?" %}
+This is unlikely. Markprompt mitigates this in various ways. For a starter, the underlying prompt is instructed to only say things with high levels of confidence based on the content that you have provided during training. The default prompt that Markprompt uses is the following:
+
+```
+{% $defaultPromptTemplate %}
+```
+
+{% note %}
+Note that this prompt can be customized via a [template](#templates), which can change this behavior, e.g. if omitting the instructions to exclusively use the information provided by the context.
+{% /note %}
+
+We also use a low temperature (0.1), giving little room for freedom. At worst, it comes with an "I don't know" result, which oftentimes is an indication that the content was not clear in the first place. Making the content more explicit, or providing more information, usually fixes this.
+{% /collapse %}
+{% collapse title="Why are no results returned even if the information is present in my content?" %}
+The main cause for this is that the section where the information is present is too long. Markprompt currently has a token cutoff of 3000, which corresponds to approximately 800 words. This means that sections longer than ca. 800 words will not be included in the context for the prompt. This is usually an acceptable limit for Markdown files, where each file is split according to headings. For plain text files, there are no obvious delimiters, so the entire file is considered to be a section. If this file has more than 3000 tokens, its content will not be part of the prompt. The solution is to either translate the file to a Markdown file with headings to chunk it up, or to split the file into smaller files and send each of them for training separately. We are working on ways to split up non-Markdown files to address this.
+{% /collapse %}
+{% collapse title="Where can I find my project keys?" %}
+Your project keys can be found by navigating to your project and opening the Settings tab.
+{% /collapse %}
+{% collapse title="Why did it fail to train on my large GitHub repo?" %}
+Syncing large repositories (>100 Mb) is not yet supported. In this case, we recommend using file uploads or the [train API](#train-content).
+{% /collapse %}
+{% collapse title="How should I structure my content for optimal performance?" %}
+I does not matter much. The language models we use, such as GPT-4, are able to surface information regardless of how it is structured. We explain this in more details in [our blog post](/blog/content-structure).
+{% /collapse %}
+{% collapse title="How should I format relative links (to other pages)?" %}
+Ideally, links in your content should fully specified, and match the ones that appear on your published site where the prompt is hosted. For instance, if a public page has the path `/docs/getting-started/introduction`, links pointing to that page should reference exactly this path. Relative links, or `#hash` links should ideally contain the base path. So on a page with path `/articles/starter`, a link of the form `#step-1` should be changed to `/articles/starter`. This is because the content containing these links will be passed on to the language model, and may come up in different ways (for instance, as part of a longer sentence containing links to different pages). If for some reason you are not able to provide links in this way, there are ways around it involving prompt engineering, and you should be able to make it work. We explain this in depth in our [prompt engineering custom business logic article](/prompt-markdown).
+{% /collapse %}
+{% /collapsegroup %}

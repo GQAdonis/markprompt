@@ -1,3 +1,6 @@
+import { promises as fs } from 'fs';
+import path from 'path';
+
 import { GetStaticProps, InferGetStaticPropsType } from 'next';
 import { FC } from 'react';
 
@@ -6,7 +9,10 @@ import { SharedHead } from '@/components/pages/SharedHead';
 import { getMarkdocStaticProps } from '@/lib/pages';
 
 export const getStaticProps: GetStaticProps = async () => {
-  return getMarkdocStaticProps(process.env.MOTIF_DOCS_PAGE_ID!);
+  const postsDirectory = path.join(process.cwd(), 'docs');
+  const filePath = path.join(postsDirectory, 'index.mdoc');
+  const fileContents = await fs.readFile(filePath, 'utf8');
+  return getMarkdocStaticProps(fileContents);
 };
 
 const DocsPage: FC<InferGetStaticPropsType<typeof getStaticProps>> = ({

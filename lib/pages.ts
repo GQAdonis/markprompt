@@ -18,10 +18,8 @@ import {
 
 import { DEFAULT_PROMPT_TEMPLATE } from './prompt';
 
-export const getMarkdocStaticProps = async (pageId: string) => {
-  const res = await fetch(`https://api.motif.land/v1/exports/raw/${pageId}`);
-  const rawText = await res.text();
-  const ast = parse(rawText);
+export const getMarkdocStaticProps = async (contents: string) => {
+  const ast = parse(contents);
   const config = {
     nodes: {
       fence: fenceNode,
