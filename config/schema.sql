@@ -197,6 +197,21 @@ begin
 end;
 $$;
 
+-- Views
+
+create materialized view file_section_content_infos as
+  select
+    f.path as path,
+    f.meta as meta,
+    fs.content as content,
+    s.type as source_type,
+    s.data as source_data,
+    p.id as project_id
+  from file_sections fs
+  left join files f on fs.file_id = f.id
+  left join sources s on f.source_id = s.id
+  left join projects p on s.project_id = p.id
+
 -- Indexes
 
 create index idx_files_source_id on files(source_id);
@@ -204,6 +219,7 @@ create index idx_sources_project_id on sources(project_id);
 create index idx_file_sections_file_id on file_sections(file_id);
 create index idx_projects_team_id on projects(team_id);
 create index idx_memberships_user_id on memberships(user_id);
+create index ix_file_sections_content ON file_sections USING pgroonga(content);
 
 -- RLS
 
