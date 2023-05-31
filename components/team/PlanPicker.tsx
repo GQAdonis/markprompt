@@ -116,10 +116,10 @@ const PricingCard = ({
   }
 
   let isHighlighted = false;
-  if (isPro && !currentPriceId) {
+  if (isPro && !currentPriceId && !isOnEnterprisePlan) {
     // If we are on a free plan, highlight Standard
     isHighlighted = true;
-  } else if (isPro && !isFree) {
+  } else if (isPro && !isFree && !isOnEnterprisePlan) {
     // If this is the current plan, and it's not Free, highlight
     isHighlighted = true;
   } else if (
@@ -129,6 +129,8 @@ const PricingCard = ({
   ) {
     // If card priceId and currentPriceId are of the same tier,
     // keep highlighted (e.g. when sliding quota range).
+    isHighlighted = true;
+  } else if (tier === 'enterprise' && isOnEnterprisePlan) {
     isHighlighted = true;
   }
 
